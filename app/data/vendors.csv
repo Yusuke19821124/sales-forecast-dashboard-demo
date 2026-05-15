@@ -1,0 +1,11 @@
+﻿vendor_id,vendor_name,category,location,country,moq,payment_terms
+V001,大阪テキスタイル,トップス,国内,日本,300,月末締め翌月末払い
+V002,Shanghai Fabric Co.,トップス,海外,中国,1000,T/T 30日
+V003,岡山デニムワークス,ボトムス,国内,日本,200,月末締め翌月末払い
+V004,Hanoi Garment Factory,ボトムス,海外,ベトナム,500,T/T 45日
+V005,Guangzhou Outerwear,アウター,海外,中国,500,L/C 60日
+V006,東京アパレル工房,アウター,国内,日本,100,月末締め翌月末払い
+V007,Bangkok Bag Maker,バッグ,海外,タイ,300,T/T 30日
+V008,浅草革工房,バッグ,国内,日本,50,月末締め翌月末払い
+V009,Seoul Accessories,アクセサリー,海外,韓国,200,T/T 30日
+V010,京都小物工房,アクセサリー,国内,日本,30,月末締め翌月末払い

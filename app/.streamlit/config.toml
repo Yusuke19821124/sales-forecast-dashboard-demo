@@ -1,0 +1,10 @@
+# .streamlit/config.toml
+# このファイルを .streamlit/config.toml として配置してください
+
+[theme]
+base            = "dark"
+backgroundColor       = "#0D1117"
+secondaryBackgroundColor = "#161B22"
+textColor             = "#E6EDF3"
+primaryColor          = "#607D8B"
+font                  = "sans serif"
