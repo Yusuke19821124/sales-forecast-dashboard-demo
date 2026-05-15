@@ -12,6 +12,7 @@ from sklearn.ensemble import GradientBoostingRegressor
 import os
 import sys
 import re
+import hmac
 
 
 def _html_compact(s: str) -> str:
@@ -41,6 +42,34 @@ def corp_display_name(customer_id: str) -> str:
 
 # ── 設定 ──
 st.set_page_config(page_title="販売予測モデル", page_icon="📊", layout="wide")
+
+# ── アクセス制御（Secrets["password"] による合言葉認証）──
+def _check_password() -> bool:
+    try:
+        expected = st.secrets["password"]
+    except Exception:
+        st.error("⚠️ 認証パスワードが未設定です。Streamlit Cloud の App settings → Secrets で `password = \"...\"` を設定してください。")
+        return False
+
+    def _on_submit():
+        if hmac.compare_digest(st.session_state.get("_pw_input", ""), str(expected)):
+            st.session_state["_pw_ok"] = True
+            st.session_state["_pw_input"] = ""
+        else:
+            st.session_state["_pw_ok"] = False
+
+    if st.session_state.get("_pw_ok", False):
+        return True
+
+    st.text_input("パスワードを入力してください", type="password",
+                  on_change=_on_submit, key="_pw_input")
+    if st.session_state.get("_pw_ok") is False:
+        st.error("パスワードが違います")
+    return False
+
+if not _check_password():
+    st.stop()
+
 APP_DIR = os.path.dirname(__file__)
 DATA_DIR = os.path.join(APP_DIR, "data")
 
