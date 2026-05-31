@@ -129,7 +129,10 @@ data = load_data()
 products     = data["product_master"]
 customers    = data["customers"]
 orders       = data["ec_orders"]
-inventory    = data["wms_inventory"]
+inventory    = data["wms_inventory"].copy()
+# 「マザー倉庫」→「EC在庫倉庫」へ名称統一（基幹倉庫→EC在庫倉庫→発送倉庫 のフロー）
+inventory["warehouse_type"] = inventory["warehouse_type"].replace({"マザー倉庫": "EC在庫倉庫"})
+inventory["warehouse_name"] = inventory["warehouse_name"].replace({"関東マザー倉庫": "関東EC在庫倉庫"})
 ga           = data["ga_behavior"]
 ads          = data["ad_performance"]
 campaigns    = data["campaigns"]
@@ -254,7 +257,7 @@ st.sidebar.markdown(
 
 _PAGES = ["ダッシュボード", "収支管理", "広告効果分析",
           "キャンペーン分析", "需要予測", "在庫分析",
-          "発注計画", "営業管理"]
+          "需要予測×在庫管理", "営業管理"]
 # クエリパラメータで初期ページ指定可（キャプチャ用途）: ?p=営業管理 や ?p=2
 _qp = st.query_params.get("p", None)
 _default_idx = 0
@@ -293,11 +296,12 @@ def _past_monthly_ad_spend():
     return a.groupby("month")["cost"].sum().to_dict()
 
 
-def forecast_category_demand(future_ad_spend_map=None):
+def forecast_category_demand(future_ad_spend_map=None, horizon=12):
     """カテゴリ別月次需要予測。
 
     future_ad_spend_map: {pd.Timestamp(月初): 広告費} の辞書（未来月のみ）
       None の場合は過去平均を未来月に流用（= 現状維持プラン相当）
+    horizon: 予測する先の月数（デフォルト12）
     """
     completed = orders[orders["status"] == "完了"]
     past_spend = _past_monthly_ad_spend()
@@ -324,7 +328,7 @@ def forecast_category_demand(future_ad_spend_map=None):
         last_num = monthly["month_num"].iloc[-1]
         last_date = monthly["date"].iloc[-1]
         future = []
-        for i in range(1, 13):
+        for i in range(1, horizon + 1):
             fd = last_date + pd.DateOffset(months=i)
             # 未来月の広告費: プラン があればそれ、なければ過去平均
             ad = (future_ad_spend_map or {}).get(fd, avg_past_spend)
@@ -747,49 +751,11 @@ if page == "ダッシュボード":
     with tcol_r:
         st.markdown(_html_compact(funnel_html), unsafe_allow_html=True)
 
-    # ── GA 示唆 / 顧客ランク / AOV 読み解き（折りたたみ） ──
-    with st.expander("📡 GA データからの示唆（新規 / リピート）"):
-        st.markdown(f"""
-**新規**
-- 流入ファネル: セッション {ga_total_sessions:,} → 商品ページ {ga_product_pv:,} → カート {ga_atc:,} → 購入 {total_orders_all:,}
-- 商品ページ到達率 {ga_product_pv/ga_total_sessions*100:.1f}% / カート投入率 {ga_atc/ga_product_pv*100:.1f}% / 購入率 {total_orders_all/ga_atc*100:.1f}%
-- 直帰率（期間平均）: {ga_bounce*100:.1f}%
-- 改善余地: 直帰率が高い流入チャネル・LPを特定し、ファーストビュー改善でCVRを底上げ
+    # ── 売上構成: 顧客種別 / カテゴリ別 / チャネル別（3カラム）──
+    section_header("売上構成", "顧客種別 / カテゴリ別 / 流入チャネル別")
+    col1, col2, col3 = st.columns(3)
 
-**リピート**
-- F2 転換率: **{f2_rate*100:.1f}%** ／ 2回以上購入 {f2_converted:,} / 全顧客 {total_unique_cust:,}
-- 既存顧客CVR（推計）: {rep_cvr*100:.2f}% — 新規 {new_cvr*100:.2f}% より高く、リピーターほど転換しやすい
-- 改善余地: ステップメール・クーポン再訴求・レビュー投稿導線で LTV 最大化
-        """)
-
-    with st.expander("💡 バスケット単価の読み解き"):
-        higher = "リピート" if rep_aov > new_aov else "新規"
-        st.markdown(f"""
-- **{higher}顧客の AOV が高い**（差分 ¥{abs(aov_delta):,.0f}）
-- 新規: 平均 {new_basket_items:.2f} 点 × ¥{new_unit_price:,.0f} / リピート: 平均 {rep_basket_items:.2f} 点 × ¥{rep_unit_price:,.0f}
-- 新規向け: クロスセルで**点数**を上げる、送料無料ラインの設計
-- リピート向け: 上位価格帯の新商品訴求・定期便・まとめ買い特典で**単価**を伸ばす
-        """)
-
-    with st.expander("👥 顧客ランク別売上（リピート基盤）"):
-        rank_sales = (completed
-                      .merge(customers[["customer_id", "customer_rank"]], on="customer_id", how="left")
-                      .groupby("customer_rank")["total_amount"].sum()
-                      .reset_index().rename(columns={"total_amount": "売上"}))
-        rank_order = ["ブロンズ", "シルバー", "ゴールド", "プラチナ"]
-        rank_sales["customer_rank"] = pd.Categorical(rank_sales["customer_rank"],
-                                                     categories=rank_order, ordered=True)
-        rank_sales = rank_sales.sort_values("customer_rank")
-        fig_rank = px.bar(rank_sales, x="customer_rank", y="売上",
-                          color_discrete_sequence=[ACCENT])
-        apply_chart_theme(fig_rank)
-        fig_rank.update_layout(height=260, xaxis_title="ランク", yaxis_title="売上（円）")
-        st.plotly_chart(fig_rank, use_container_width=True)
-
-    # ── 顧客種別（個人 / 個人事業主 / 法人）──
-    col_l, col_r = st.columns(2)
-
-    st.subheader("顧客種別の売上構成")
+    # 顧客種別売上
     cust_type_sales = (completed
                        .merge(customers[["customer_id", "customer_type"]], on="customer_id", how="left")
                        .groupby("customer_type")["total_amount"].sum()
@@ -797,9 +763,9 @@ if page == "ダッシュボード":
     fig_ctype = px.pie(cust_type_sales, names="customer_type", values="売上",
                        title="顧客種別 売上構成",
                        color_discrete_sequence=COLORS["chart"])
-    col_l.plotly_chart(fig_ctype, use_container_width=True)
+    col1.plotly_chart(fig_ctype, use_container_width=True)
 
-    # ── カテゴリ別売上 ──
+    # カテゴリ別売上
     cat_sales = (completed
                  .merge(products[["sku_id", "category"]], on="sku_id", how="left")
                  .groupby("category")["total_amount"].sum()
@@ -807,10 +773,54 @@ if page == "ダッシュボード":
     fig_cat = px.pie(cat_sales, names="category", values="売上",
                      title="カテゴリ別売上構成",
                      color_discrete_sequence=COLORS["chart"])
-    col_r.plotly_chart(fig_cat, use_container_width=True)
+    col2.plotly_chart(fig_cat, use_container_width=True)
+
+    # チャネル別売上（流入チャネルを last-touch で注文に帰属）
+    _CH_BUCKET = {
+        "自然検索": "自然検索",
+        "検索広告": "デジタル広告",
+        "ディスプレイ広告": "デジタル広告",
+        "リターゲ": "デジタル広告",
+        "DM": "メルマガ／DM",
+        "ダイレクト": "ダイレクト",
+    }
+    if ga_sessions is not None and not ga_sessions.empty:
+        _o = (completed[["order_id", "customer_id", "order_date", "total_amount"]]
+              .sort_values("order_date"))
+        _g = ga_sessions[["customer_id", "date", "channel"]].sort_values("date")
+        _att = pd.merge_asof(_o, _g, left_on="order_date", right_on="date",
+                             by="customer_id", direction="backward")
+        _att["チャネル"] = _att["channel"].map(_CH_BUCKET).fillna("ダイレクト")
+        ch_sales = (_att.groupby("チャネル")["total_amount"].sum()
+                    .reset_index().rename(columns={"total_amount": "売上"})
+                    .sort_values("売上", ascending=False))
+        fig_ch = px.pie(ch_sales, names="チャネル", values="売上",
+                        title="チャネル別売上構成",
+                        color_discrete_sequence=COLORS["chart"])
+        col3.plotly_chart(fig_ch, use_container_width=True)
+    else:
+        col3.info("チャネルデータがありません")
+
+    # ── 品番別売上ランキング ──
+    _n_sku = completed["sku_id"].nunique()
+    section_header("品番別売上ランキング",
+                   f"売上上位の品番（完了注文ベース・上位15 / 全{_n_sku}品番）")
+    _pm = products[["sku_id", "product_name", "color", "size"]].copy()
+    _pm["品番"] = (_pm["product_name"] + " " + _pm["color"].astype(str)
+                   + "/" + _pm["size"].astype(str) + "（" + _pm["sku_id"] + "）")
+    prod_sales = (completed
+                  .merge(_pm[["sku_id", "品番"]], on="sku_id", how="left")
+                  .groupby("品番")["total_amount"].sum()
+                  .sort_values(ascending=False)
+                  .head(15)
+                  .reset_index().rename(columns={"total_amount": "売上"}))
+    fig_prod = px.bar(prod_sales, x="売上", y="品番", orientation="h",
+                      color_discrete_sequence=[ACCENT])
+    fig_prod.update_layout(yaxis_title="品番", xaxis_title="売上（円）",
+                           yaxis=dict(autorange="reversed"), height=520)
+    st.plotly_chart(fig_prod, use_container_width=True)
 
     # ── 都道府県別売上 ──
-    st.subheader("都道府県別 売上")
     pref_sales = (completed
                   .merge(customers[["customer_id", "prefecture"]], on="customer_id", how="left")
                   .groupby("prefecture")["total_amount"].sum()
@@ -859,9 +869,10 @@ elif page == "需要予測":
     model.fit(monthly[feature_cols].values, monthly["sales"].values)
 
     last_month_num = monthly["month_num"].iloc[-1]
-    last_date = monthly["date"].iloc[-1]
+    last_date = monthly["date"].iloc[-1]  # 現在 = 直近実績月（モック前提: 2026/9）
+    FORECAST_MONTHS = 6
     future_rows = []
-    for i in range(1, 13):
+    for i in range(1, FORECAST_MONTHS + 1):
         fdate = last_date + pd.DateOffset(months=i)
         row = {"date": fdate, "month_num": last_month_num + i, "month_of_year": fdate.month}
         for m in range(1, 13):
@@ -869,10 +880,9 @@ elif page == "需要予測":
         future_rows.append(row)
     future_df = pd.DataFrame(future_rows)
     future_df["sales"] = model.predict(future_df[feature_cols].values)
-    residuals = monthly["sales"].values - model.predict(monthly[feature_cols].values)
-    std_res = np.std(residuals)
-    future_df["lower"] = future_df["sales"] - 1.5 * std_res
-    future_df["upper"] = future_df["sales"] + 1.5 * std_res
+    # 下限・上限は予測売上から ±30% の幅
+    future_df["lower"] = future_df["sales"] * 0.7
+    future_df["upper"] = future_df["sales"] * 1.3
 
     st.subheader("月次売上の実績と予測")
     fig = go.Figure()
@@ -887,16 +897,34 @@ elif page == "需要予測":
         y=pd.concat([future_df["upper"], future_df["lower"][::-1]]),
         fill="toself", fillcolor="rgba(229,115,115,0.15)",
         line=dict(color="rgba(0,0,0,0)"), name="予測範囲"))
-    fig.update_layout(title="売上推移と12ヶ月予測",
+    fig.update_layout(title="売上推移と6ヶ月予測",
                       xaxis_title="月", yaxis_title="売上（円）", hovermode="x unified")
     st.plotly_chart(fig, use_container_width=True)
 
-    disp = future_df[["date", "sales", "lower", "upper"]].copy()
-    disp.columns = ["月", "予測売上", "下限", "上限"]
-    disp["月"] = disp["月"].dt.strftime("%Y年%m月")
-    for c in ["予測売上", "下限", "上限"]:
-        disp[c] = disp[c].apply(lambda v: f"¥{v:,.0f}")
-    st.dataframe(disp, use_container_width=True, hide_index=True)
+    # ── 実績（2026/03〜2026/09）＋ 予測（2026/10〜2027/03）の対比表（中央＝現在 2026/9）──
+    st.subheader("売上 実績・予測テーブル（中央＝現在 2026/9）")
+    st.caption("左＝2026/03〜2026/09の実績、右＝2026/10〜2027/03の予測（下限 −30% ／ 上限 +30%）。"
+               "※ 2026/04・05は新ECローンチ前で実績データがありません。")
+    # 左側: 2026/03〜2026/09 の実績（データのない月は「—」）
+    left_months = pd.date_range("2026-03-01", "2026-09-01", freq="MS")
+    _past_s = monthly.set_index("date")["sales"]
+    past_tbl = pd.DataFrame({"date": left_months})
+    past_tbl["区分"] = "実績"
+    past_tbl["売上"] = past_tbl["date"].map(_past_s).apply(
+        lambda v: "—" if pd.isna(v) else f"¥{v:,.0f}")
+    past_tbl["下限"] = "—"
+    past_tbl["上限"] = "—"
+    # 右側: 予測6ヶ月（2026/10〜2027/03）
+    fut_tbl = future_df[["date", "sales", "lower", "upper"]].copy()
+    fut_tbl["区分"] = "予測"
+    fut_tbl["売上"] = fut_tbl["sales"].apply(lambda v: f"¥{v:,.0f}")
+    fut_tbl["下限"] = fut_tbl["lower"].apply(lambda v: f"¥{v:,.0f}")
+    fut_tbl["上限"] = fut_tbl["upper"].apply(lambda v: f"¥{v:,.0f}")
+    _cols = ["date", "区分", "売上", "下限", "上限"]
+    tbl = pd.concat([past_tbl[_cols], fut_tbl[_cols]], ignore_index=True)
+    tbl["月"] = tbl["date"].dt.strftime("%Y/%m")
+    tbl_t = tbl.set_index("月")[["区分", "売上", "下限", "上限"]].T
+    st.dataframe(tbl_t, use_container_width=True)
 
     # ── SKU別 予測販売数 ──
     st.markdown("---")
@@ -911,6 +939,8 @@ elif page == "需要予測":
     else:
         plan_work = ad_plan.copy()
         plan_work["month_ts"] = pd.to_datetime(plan_work["month"] + "-01")
+        # 現在から6ヶ月先（予測期間と同じ月）のプランのみに絞る
+        plan_work = plan_work[plan_work["month_ts"].isin(set(future_df["date"]))].copy()
 
         channels = sorted(plan_work["channel"].unique())
         st.markdown("**媒体別 予算調整スライダー**（1.0 = プラン通り）")
@@ -938,7 +968,7 @@ elif page == "需要予測":
         delta_budget = total_adjusted - total_planned
 
         mk1, mk2, mk3 = st.columns(3)
-        mk1.metric("プラン総予算（12ヶ月）", f"¥{total_planned:,}")
+        mk1.metric("プラン総予算（6ヶ月）", f"¥{total_planned:,}")
         mk2.metric("調整後 総予算", f"¥{total_adjusted:,}",
                    delta=f"¥{delta_budget:+,}")
         mk3.metric("増減率", f"{(delta_budget/total_planned*100 if total_planned else 0):+.1f}%")
@@ -952,65 +982,15 @@ elif page == "需要予測":
                     pivot_disp.loc[idx, c] = f"¥{pivot.loc[idx, c]:,.0f}"
             st.dataframe(pivot_disp, use_container_width=True)
 
-        # 予測用の辞書: {month_ts: adjusted total}
+        # 予測用の辞書（調整後）: {month_ts: adjusted total} — 下の SKU別予測に反映
         future_ad_map = dict(zip(monthly_plan["month_ts"], monthly_plan["adjusted"].astype(float)))
-        # ベースライン比較用: プラン通りの辞書
-        baseline_ad_map = dict(zip(monthly_plan["month_ts"], monthly_plan["planned"].astype(float)))
-
-        # 2パターン予測: プラン通り / 調整後
-        demand_baseline = forecast_category_demand(baseline_ad_map)
-        demand_adjusted = forecast_category_demand(future_ad_map)
-
-        # 総需要比較グラフ
-        total_base = pd.concat([v["forecast"][["date", "qty"]].assign(cat=k)
-                                 for k, v in demand_baseline.items()])
-        total_adj = pd.concat([v["forecast"][["date", "qty"]].assign(cat=k)
-                                for k, v in demand_adjusted.items()])
-        sum_base = total_base.groupby("date")["qty"].sum().reset_index().rename(columns={"qty": "プラン通り"})
-        sum_adj = total_adj.groupby("date")["qty"].sum().reset_index().rename(columns={"qty": "調整後"})
-        merged = sum_base.merge(sum_adj, on="date")
-        merged["差分"] = merged["調整後"] - merged["プラン通り"]
-
-        fig_sim = go.Figure()
-        fig_sim.add_trace(go.Bar(x=merged["date"], y=merged["プラン通り"],
-                                  name="プラン通り", marker_color="#90A4AE"))
-        fig_sim.add_trace(go.Bar(x=merged["date"], y=merged["調整後"],
-                                  name="調整後", marker_color=COLORS["accent"]))
-        fig_sim.update_layout(title="総需要予測: プラン通り vs 調整後",
-                               barmode="group", xaxis_title="月", yaxis_title="販売数")
-        st.plotly_chart(fig_sim, use_container_width=True)
-
-        # 差分サマリ
-        total_base_qty = int(merged["プラン通り"].sum())
-        total_adj_qty = int(merged["調整後"].sum())
-        qty_delta = total_adj_qty - total_base_qty
-        # 簡易 ROAS: AOV × 販売数差分 / 予算差分
-        completed_all = orders[orders["status"] == "完了"]
-        overall_aov = completed_all["total_amount"].sum() / completed_all["order_id"].nunique()
-        est_rev_delta = int(qty_delta * overall_aov)
-        roas = (est_rev_delta / delta_budget) if delta_budget != 0 else 0
-
-        rk1, rk2, rk3 = st.columns(3)
-        rk1.metric("12ヶ月 総需要（プラン）", f"{total_base_qty:,} 個")
-        rk2.metric("12ヶ月 総需要（調整後）", f"{total_adj_qty:,} 個",
-                   delta=f"{qty_delta:+,} 個")
-        rk3.metric("予算差分あたり 推計ROAS",
-                   f"{roas:.2f}" if delta_budget != 0 else "—",
-                   help="推計売上増分（AOV×販売数差分）÷ 予算差分")
-
-        if delta_budget != 0:
-            if roas > 1.5:
-                st.success(f"✅ ROAS {roas:.2f} — 予算増の投資対効果が高そうです（推計売上増 ¥{est_rev_delta:+,.0f}）")
-            elif roas < 0.5 and delta_budget > 0:
-                st.warning(f"⚠️ ROAS {roas:.2f} — 予算増に対する効果が弱め。媒体配分の見直しを検討")
-            else:
-                st.info(f"📊 ROAS {roas:.2f} — 推計売上増分 ¥{est_rev_delta:+,.0f}")
+        st.caption("スライダーの調整結果は、下の「SKU別 予測販売数」に反映されます。")
 
     st.markdown("---")
-    st.subheader("SKU別 予測販売数（来月〜12ヶ月先）")
+    st.subheader("SKU別 予測販売数（来月〜6ヶ月先）")
     st.markdown("各SKUがどれだけ売れるかの予測です。下の表は **調整後プラン** に基づきます。")
 
-    demand = forecast_category_demand(future_ad_map)
+    demand = forecast_category_demand(future_ad_map, horizon=6)
 
     sel_cat_sku = st.selectbox("カテゴリを選択", sorted(demand.keys()), key="sku_fc_cat")
     if sel_cat_sku in demand:
@@ -1048,7 +1028,7 @@ elif page == "需要予測":
 
         # カテゴリ合計
         total_cat = sku_fc_df["合計"].sum()
-        st.info(f"📦 {sel_cat_sku} 全体: 12ヶ月間で **{total_cat:,}個** の販売を予測")
+        st.info(f"📦 {sel_cat_sku} 全体: 6ヶ月間で **{total_cat:,}個** の販売を予測")
 
     # ── カテゴリ別推移 ──
     st.subheader("カテゴリ別 月次売上推移")
@@ -1064,27 +1044,32 @@ elif page == "需要予測":
 
 
 # ============================================================
-# 🏭 発注計画
+# 🏭 需要予測×在庫管理
 # ============================================================
-elif page == "発注計画":
-    page_header("発注計画", "3ステップで在庫不足を検知し、発注アラートを管理します",
-                key_prefix="order",
+elif page == "需要予測×在庫管理":
+    page_header("需要予測×在庫管理",
+                "需要予測をもとに、基幹倉庫→EC在庫倉庫→発送倉庫の在庫を最適化します",
+                key_prefix="invmgmt",
                 latest_date=orders["order_date"].max())
 
     completed = orders[orders["status"] == "完了"]
     demand = forecast_category_demand()
     latest_inv = inventory[inventory["date"] == inventory["date"].max()]
 
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # 機能A: 短期 倉庫間補充 + 在庫切れリスク発注期限
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    st.header("【短期】在庫補充シミュレーション")
-    st.markdown("""
-    **3ステップで在庫の過不足を判定します**
+    # 横持ち移動（基幹倉庫→EC在庫倉庫）のリードタイム（日）
+    TRANSFER_LEAD_DAYS = 7
+    # モック前提の「現在」
+    NOW = pd.Timestamp("2026-09-30")
 
-    > **STEP 1** 需要予測から、発送倉庫で足りない分を特定
-    > → **STEP 2** 不足分をマザー倉庫から事前に移動
-    > → **STEP 3** それでも足りない分 → **発注アラート**（期限付き）
+    st.markdown("""
+    **在庫フロー: 基幹倉庫（本業）→ EC在庫倉庫 → 発送倉庫**
+
+    本業（EC以外）が売上の大半を占めるため、ECで生産発注は行いません。
+    需要予測に対して在庫が不足するSKUは、**基幹倉庫から横持ち移動**で補充します。
+
+    > **STEP 1** 需要予測から、発送倉庫で足りないSKUを特定
+    > → **STEP 2** 不足分を **EC在庫倉庫** から発送倉庫へ移動
+    > → **STEP 3** EC在庫倉庫でも足りない分 → **基幹倉庫から EC在庫倉庫へ移動**（移動時期つき）
     """)
 
     replenish_rows = []
@@ -1096,33 +1081,30 @@ elif page == "発注計画":
         n_skus = max(1, len(cat_skus))
         per_sku_demand = max(1, int(next_month_qty / n_skus))
 
-        sc_steps = supply_chain[supply_chain["category"] == cat]
-        total_lead = int(sc_steps["lead_time_days"].sum()) if len(sc_steps) > 0 else 60
-
         for sku_id in cat_skus:
             ship_inv = latest_inv[(latest_inv["sku_id"] == sku_id) &
                                   (latest_inv["warehouse_type"] == "発送倉庫")]
-            mother_inv = latest_inv[(latest_inv["sku_id"] == sku_id) &
-                                    (latest_inv["warehouse_type"] == "マザー倉庫")]
+            ec_inv = latest_inv[(latest_inv["sku_id"] == sku_id) &
+                                (latest_inv["warehouse_type"] == "EC在庫倉庫")]
             ship_stock = int(ship_inv["stock_quantity"].sum()) if len(ship_inv) > 0 else 0
-            mother_stock = int(mother_inv["stock_quantity"].sum()) if len(mother_inv) > 0 else 0
-            total_stock = ship_stock + mother_stock
+            ec_stock = int(ec_inv["stock_quantity"].sum()) if len(ec_inv) > 0 else 0
+            total_stock = ship_stock + ec_stock
             shortage_from_ship = max(0, per_sku_demand - ship_stock)
-            transfer = min(shortage_from_ship, mother_stock)
-            still_short = max(0, per_sku_demand - total_stock)
+            transfer = min(shortage_from_ship, ec_stock)  # EC在庫倉庫 → 発送倉庫
+            still_short = max(0, per_sku_demand - total_stock)  # 基幹倉庫から移動が必要な量
             prod = products[products["sku_id"] == sku_id].iloc[0]
 
-            # 発注期限の算出
+            # 基幹倉庫からEC在庫倉庫への移動が必要な時期
             if still_short > 0:
                 daily_demand = max(1, per_sku_demand // 30)
                 days_until_stockout = max(0, total_stock // daily_demand)
-                stockout_date = pd.Timestamp.now() + pd.Timedelta(days=days_until_stockout)
-                order_deadline = stockout_date - pd.Timedelta(days=total_lead)
-                deadline_str = order_deadline.strftime("%Y/%m/%d")
-                status = "🚨 要発注"
+                stockout_date = NOW + pd.Timedelta(days=days_until_stockout)
+                move_deadline = stockout_date - pd.Timedelta(days=TRANSFER_LEAD_DAYS)
+                deadline_str = move_deadline.strftime("%Y/%m/%d")
+                status = "🚨 基幹倉庫から移動"
             elif shortage_from_ship > 0:
                 deadline_str = ""
-                status = "🔄 マザーから移動"
+                status = "🔄 EC在庫倉庫から移動"
             else:
                 deadline_str = ""
                 status = "✅ 在庫十分"
@@ -1134,27 +1116,27 @@ elif page == "発注計画":
                 "サイズ": prod["size"],
                 "来月予測需要": per_sku_demand,
                 "発送倉庫 在庫": ship_stock,
-                "マザー倉庫 在庫": mother_stock,
+                "EC在庫倉庫 在庫": ec_stock,
                 "STEP1 発送不足": shortage_from_ship,
-                "STEP2 マザー移動": transfer,
-                "STEP3 それでも不足": still_short,
-                "発注期限": deadline_str,
+                "STEP2 EC在庫倉庫から移動": transfer,
+                "STEP3 基幹倉庫から移動": still_short,
+                "基幹倉庫からの移動期限": deadline_str,
                 "判定": status,
             })
 
     if replenish_rows:
         rep_df = pd.DataFrame(replenish_rows)
-        needs_order = rep_df[rep_df["判定"] == "🚨 要発注"]
-        needs_transfer = rep_df[rep_df["判定"] == "🔄 マザーから移動"]
+        needs_core = rep_df[rep_df["判定"] == "🚨 基幹倉庫から移動"]
+        needs_transfer = rep_df[rep_df["判定"] == "🔄 EC在庫倉庫から移動"]
         ok_skus = rep_df[rep_df["判定"] == "✅ 在庫十分"]
 
         # ── KPI ──
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("在庫十分", f"{len(ok_skus)} SKU")
-        col2.metric("マザーから移動で対応", f"{len(needs_transfer)} SKU")
-        col3.metric("🚨 追加発注が必要", f"{len(needs_order)} SKU")
-        total_short = int(needs_order["STEP3 それでも不足"].sum()) if len(needs_order) > 0 else 0
-        col4.metric("追加発注 総数", f"{total_short:,}個")
+        col2.metric("EC在庫倉庫から移動で対応", f"{len(needs_transfer)} SKU")
+        col3.metric("🚨 基幹倉庫から移動が必要", f"{len(needs_core)} SKU")
+        total_short = int(needs_core["STEP3 基幹倉庫から移動"].sum()) if len(needs_core) > 0 else 0
+        col4.metric("基幹倉庫から移動 総数", f"{total_short:,}個")
 
         # ── STEP 1: 発送倉庫の不足 ──
         st.subheader("STEP 1: 需要予測に対する発送倉庫の過不足")
@@ -1164,167 +1146,56 @@ elif page == "発注計画":
         else:
             st.success("発送倉庫の在庫で来月の需要を充足できます。")
 
-        # ── STEP 2: マザー倉庫からの移動 ──
-        st.subheader("STEP 2: マザー倉庫からの事前移動")
+        # ── STEP 2: EC在庫倉庫からの移動 ──
+        st.subheader("STEP 2: EC在庫倉庫から発送倉庫への移動")
         if len(needs_transfer) > 0:
-            st.info(f"🔄 **{len(needs_transfer)} SKU** はマザー倉庫からの移動で対応可能です")
-            with st.expander(f"マザー倉庫から移動で対応（{len(needs_transfer)} SKU）— 詳細を見る"):
+            st.info(f"🔄 **{len(needs_transfer)} SKU** はEC在庫倉庫からの移動で対応可能です")
+            with st.expander(f"EC在庫倉庫から移動で対応（{len(needs_transfer)} SKU）— 詳細を見る"):
                 st.dataframe(needs_transfer[["商品名", "カテゴリ", "色", "サイズ",
                              "来月予測需要", "発送倉庫 在庫", "STEP1 発送不足",
-                             "マザー倉庫 在庫", "STEP2 マザー移動"]],
+                             "EC在庫倉庫 在庫", "STEP2 EC在庫倉庫から移動"]],
                              use_container_width=True, hide_index=True)
 
-        # ── STEP 3: それでも不足 → 発注アラート ──
-        st.subheader("STEP 3: マザー倉庫でも賄えない → 発注アラート")
-        if len(needs_order) > 0:
+        # ── STEP 3: EC在庫倉庫でも不足 → 基幹倉庫から移動 ──
+        st.subheader("STEP 3: EC在庫倉庫でも不足 → 基幹倉庫から移動")
+        if len(needs_core) > 0:
             st.error(f"""
-            🚨 **{len(needs_order)} SKU** がマザー倉庫の在庫でも賄えません。
-            合計 **{total_short:,}個** の追加発注が必要です。
+            🚨 **{len(needs_core)} SKU** がEC在庫倉庫の在庫でも賄えません。
+            合計 **{total_short:,}個** を基幹倉庫からEC在庫倉庫へ移動する必要があります。
             """)
 
-            # カテゴリ別サマリー
-            cat_summary = (needs_order.groupby("カテゴリ")
+            # カテゴリ別サマリー（移動が必要な順）
+            cat_summary = (needs_core.groupby("カテゴリ")
                            .agg(SKU数=("商品名", "count"),
-                                不足合計=("STEP3 それでも不足", "sum"),
-                                最短発注期限=("発注期限", "min"))
+                                不足合計=("STEP3 基幹倉庫から移動", "sum"),
+                                最短移動期限=("基幹倉庫からの移動期限", "min"))
                            .reset_index()
-                           .sort_values("最短発注期限"))
+                           .sort_values("最短移動期限"))
             cat_summary["不足合計"] = cat_summary["不足合計"].apply(lambda v: f"{int(v):,}個")
 
-            st.markdown("**カテゴリ別 発注アラート**")
+            st.markdown("**カテゴリ別 移動アラート（移動が必要な順）**")
             for _, row in cat_summary.iterrows():
-                deadline = row["最短発注期限"]
-                if deadline and pd.Timestamp(deadline) <= pd.Timestamp.now() + pd.Timedelta(days=14):
+                deadline = row["最短移動期限"]
+                if deadline and pd.Timestamp(deadline) <= NOW + pd.Timedelta(days=14):
                     st.error(f"🚨 **{row['カテゴリ']}**: {row['不足合計']}不足 / "
-                             f"{row['SKU数']} SKU / **{deadline} までに発注必須**")
-                elif deadline and pd.Timestamp(deadline) <= pd.Timestamp.now() + pd.Timedelta(days=30):
+                             f"{row['SKU数']} SKU / **{deadline} までに基幹倉庫から移動**")
+                elif deadline and pd.Timestamp(deadline) <= NOW + pd.Timedelta(days=30):
                     st.warning(f"⚠️ **{row['カテゴリ']}**: {row['不足合計']}不足 / "
-                               f"{row['SKU数']} SKU / {deadline} までに発注")
+                               f"{row['SKU数']} SKU / {deadline} までに移動")
                 else:
                     st.info(f"📋 **{row['カテゴリ']}**: {row['不足合計']}不足 / "
-                            f"{row['SKU数']} SKU / {deadline} までに発注")
+                            f"{row['SKU数']} SKU / {deadline} までに移動")
 
-            st.markdown("**詳細一覧（発注期限順）**")
-            order_disp = needs_order.sort_values("発注期限")
-            st.dataframe(order_disp[["商品名", "カテゴリ", "色", "サイズ",
-                         "来月予測需要", "発送倉庫 在庫", "マザー倉庫 在庫",
-                         "STEP3 それでも不足", "発注期限"]],
+            st.markdown("**詳細一覧（移動が必要な順）**")
+            move_disp = needs_core.sort_values("基幹倉庫からの移動期限")
+            st.dataframe(move_disp[["商品名", "カテゴリ", "色", "サイズ",
+                         "来月予測需要", "発送倉庫 在庫", "EC在庫倉庫 在庫",
+                         "STEP3 基幹倉庫から移動", "基幹倉庫からの移動期限"]],
                          use_container_width=True, hide_index=True)
         else:
-            st.success("✅ すべてのSKUがマザー倉庫からの移動で対応可能です。追加発注は不要です。")
+            st.success("✅ すべてのSKUがEC在庫倉庫からの移動で対応可能です。基幹倉庫からの移動は不要です。")
     else:
         st.success("来月の予測需要に対し、発送倉庫の在庫は十分です。")
-
-    st.markdown("---")
-
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # 機能B: 中長期 生産発注タイムライン
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    st.header("【中長期】生産発注タイムライン")
-    st.caption("担当: MD / 商品生産部 / 調達チーム")
-    st.markdown("来期の需要予測から必要生産数を算出し、工程を逆算して発注期限を表示します。")
-
-    sel_cat_b = st.selectbox("カテゴリを選択", sorted(demand.keys()), key="sc_cat")
-
-    if sel_cat_b in demand:
-        fc = demand[sel_cat_b]["forecast"]
-        cat_skus_b = products[products["category"] == sel_cat_b]["sku_id"].tolist()
-        mother_current = int(latest_inv[
-            (latest_inv["sku_id"].isin(cat_skus_b)) &
-            (latest_inv["warehouse_type"] == "マザー倉庫")
-        ]["stock_quantity"].sum())
-
-        st.subheader("カテゴリ需要予測（6ヶ月）")
-        col_l, col_r = st.columns([2, 1])
-        fig_fc = px.bar(fc, x="date", y="qty",
-                        title=f"{sel_cat_b} — 月別予測販売数",
-                        color_discrete_sequence=[COLORS["accent"]])
-        fig_fc.update_layout(xaxis_title="月", yaxis_title="予測数")
-        col_l.plotly_chart(fig_fc, use_container_width=True)
-
-        col_r.metric("マザー倉庫 現在庫", f"{mother_current:,}")
-        total_demand = int(fc["qty"].sum())
-        col_r.metric("6ヶ月 総予測需要", f"{total_demand:,}")
-        production_needed = max(0, total_demand - mother_current)
-        col_r.metric("必要生産数", f"{production_needed:,}",
-                     delta=f"不足 {production_needed:,}" if production_needed > 0 else "在庫で充足",
-                     delta_color="inverse")
-
-        if production_needed > 0:
-            st.subheader("生産発注タイムライン")
-            sc_steps = supply_chain[supply_chain["category"] == sel_cat_b].sort_values("step_order")
-            total_lead = sc_steps["lead_time_days"].sum()
-            peak_month_ts = pd.Timestamp(fc.loc[fc["qty"].idxmax(), "date"])
-            cat_vendors = vendors[vendors["category"] == sel_cat_b]
-
-            st.info(f"📅 繁忙期: **{peak_month_ts.strftime('%Y年%m月')}** / "
-                    f"合計リードタイム: **{total_lead}日（約{total_lead // 7}週間）** / "
-                    f"必要生産数: **{production_needed:,}個**")
-
-            gantt_rows = []
-            current_end = peak_month_ts
-            for _, step in sc_steps.iloc[::-1].iterrows():
-                step_end = current_end
-                step_start = current_end - pd.Timedelta(days=step["lead_time_days"])
-                gantt_rows.append({
-                    "工程": step["step_name"], "開始": step_start, "終了": step_end,
-                    "日数": step["lead_time_days"], "内容": step["description"],
-                })
-                current_end = step_start
-            gantt_df = pd.DataFrame(gantt_rows[::-1])
-            order_deadline = gantt_df["開始"].min()
-
-            st.error(f"🚨 **発注期限: {order_deadline.strftime('%Y年%m月%d日')}** "
-                     f"— この日までに最初の工程（{gantt_df.iloc[0]['工程']}）を開始する必要があります")
-
-            fig_gantt = go.Figure()
-            colors_g = ["#36454F", "#455A64", "#546E7A", "#607D8B", "#78909C"]
-            for i, (_, row) in enumerate(gantt_df.iterrows()):
-                fig_gantt.add_trace(go.Bar(
-                    x=[(row["終了"] - row["開始"]).days], y=[row["工程"]],
-                    base=row["開始"], orientation="h", name=row["工程"],
-                    marker_color=colors_g[i % len(colors_g)],
-                    text=f'{row["日数"]}日', textposition="inside",
-                    hovertext=f'{row["内容"]}<br>{row["開始"].strftime("%m/%d")}〜{row["終了"].strftime("%m/%d")}',
-                ))
-            deadline_str = order_deadline.strftime("%Y-%m-%d")
-            peak_str = peak_month_ts.strftime("%Y-%m-%d")
-            fig_gantt.add_shape(type="line", x0=deadline_str, x1=deadline_str,
-                                y0=0, y1=1, yref="paper",
-                                line=dict(dash="dash", color="#E57373", width=2))
-            fig_gantt.add_annotation(x=deadline_str, y=1.02, yref="paper",
-                                     text="発注期限", showarrow=False,
-                                     xanchor="right", yanchor="bottom",
-                                     font=dict(color="#E57373"))
-            fig_gantt.add_shape(type="line", x0=peak_str, x1=peak_str,
-                                y0=0, y1=1, yref="paper",
-                                line=dict(dash="dash", color=COLORS["accent"], width=2))
-            fig_gantt.add_annotation(x=peak_str, y=1.02, yref="paper",
-                                     text="繁忙期", showarrow=False,
-                                     xanchor="left", yanchor="bottom",
-                                     font=dict(color=COLORS["accent"]))
-            fig_gantt.update_layout(title=f"{sel_cat_b} — 生産工程タイムライン",
-                                    xaxis_title="日付", showlegend=False, barmode="stack", height=300)
-            st.plotly_chart(fig_gantt, use_container_width=True)
-
-            gantt_disp = gantt_df.copy()
-            gantt_disp["開始"] = gantt_disp["開始"].dt.strftime("%Y/%m/%d")
-            gantt_disp["終了"] = gantt_disp["終了"].dt.strftime("%Y/%m/%d")
-            st.dataframe(gantt_disp, use_container_width=True, hide_index=True)
-
-            st.subheader("対応ベンダー")
-            if len(cat_vendors) > 0:
-                vd = cat_vendors.copy()
-                vd["moq"] = vd["moq"].apply(lambda v: f"{v:,}個")
-                st.dataframe(vd[["vendor_name", "location", "country", "moq", "payment_terms"]],
-                             use_container_width=True, hide_index=True)
-                for _, v in cat_vendors.iterrows():
-                    lots = max(1, int(np.ceil(production_needed / v["moq"])))
-                    order_qty = lots * v["moq"]
-                    st.markdown(f"- **{v['vendor_name']}**（{v['country']}）: "
-                                f"MOQ {v['moq']:,}個 × {lots}ロット = **{order_qty:,}個** 発注")
-        else:
-            st.success("現在のマザー倉庫在庫で6ヶ月分の需要を充足できます。追加生産は不要です。")
 
 
 # ============================================================
@@ -1375,6 +1246,69 @@ elif page == "広告効果分析":
                             xaxis_tickangle=-45, hovermode="x unified")
     st.plotly_chart(fig_trend, use_container_width=True)
 
+    # ── 広告経由の注文を特定（流入チャネル last-touch）→ 品番別 売上 / 利益 ──
+    _AD_CHANNELS = {"検索広告", "ディスプレイ広告", "リターゲ"}
+    _comp_ad = orders[orders["status"] == "完了"].copy()
+    if ga_sessions is not None and not ga_sessions.empty:
+        _oo = (_comp_ad[["order_id", "customer_id", "order_date", "sku_id", "quantity", "total_amount"]]
+               .sort_values("order_date"))
+        _gg = ga_sessions[["customer_id", "date", "channel"]].sort_values("date")
+        _m = pd.merge_asof(_oo, _gg, left_on="order_date", right_on="date",
+                           by="customer_id", direction="backward")
+        ad_orders = _m[_m["channel"].isin(_AD_CHANNELS)].copy()
+
+        # 品番ラベル + 原価から粗利を算出
+        _pm = products[["sku_id", "product_name", "color", "size", "cost_price"]].copy()
+        _pm["品番"] = (_pm["product_name"] + " " + _pm["color"].astype(str)
+                       + "/" + _pm["size"].astype(str) + "（" + _pm["sku_id"] + "）")
+        ad_orders = ad_orders.merge(_pm[["sku_id", "品番", "cost_price"]], on="sku_id", how="left")
+        ad_orders["利益"] = ad_orders["total_amount"] - ad_orders["cost_price"] * ad_orders["quantity"]
+        ad_orders["month"] = ad_orders["order_date"].dt.to_period("M").astype(str)
+
+        # (1) 広告経由 売上品番ランキング
+        st.subheader("広告経由 売上品番ランキング")
+        st.caption("流入チャネルが広告（検索広告／ディスプレイ広告／リターゲ）の完了注文を品番別に集計・上位15")
+        ad_prod_rev = (ad_orders.groupby("品番")["total_amount"].sum()
+                       .sort_values(ascending=False).head(15)
+                       .reset_index().rename(columns={"total_amount": "売上"}))
+        fig_ad_rev = px.bar(ad_prod_rev, x="売上", y="品番", orientation="h",
+                            color_discrete_sequence=[COLORS["accent"]])
+        fig_ad_rev.update_layout(yaxis_title="品番", xaxis_title="広告経由 売上（円）",
+                                 yaxis=dict(autorange="reversed"), height=520)
+        st.plotly_chart(fig_ad_rev, use_container_width=True)
+
+        # (2) 月次 広告費 vs 利益
+        st.subheader("月次 広告費 vs 利益")
+        st.caption("広告費は媒体実績、利益は広告経由注文の粗利（売上−原価）")
+        ad_cost_monthly = (ads.assign(month=ads["date"].dt.to_period("M").astype(str))
+                           .groupby("month")["cost"].sum().reset_index(name="広告費"))
+        ad_profit_monthly = ad_orders.groupby("month")["利益"].sum().reset_index(name="広告経由利益")
+        pm_merge = (ad_cost_monthly.merge(ad_profit_monthly, on="month", how="outer")
+                    .fillna(0).sort_values("month"))
+        fig_ap = go.Figure()
+        fig_ap.add_trace(go.Bar(x=pm_merge["month"], y=pm_merge["広告費"],
+                                name="広告費", marker_color=COLORS["light"]))
+        fig_ap.add_trace(go.Scatter(x=pm_merge["month"], y=pm_merge["広告経由利益"],
+                                    name="広告経由利益", mode="lines+markers",
+                                    line=dict(color=COLORS["primary"], width=2), yaxis="y2"))
+        fig_ap.update_layout(yaxis=dict(title="広告費（円）"),
+                             yaxis2=dict(title="広告経由利益（円）", overlaying="y", side="right"),
+                             xaxis_tickangle=-45, hovermode="x unified")
+        st.plotly_chart(fig_ap, use_container_width=True)
+
+        # (3) 広告経由 利益品番ランキング
+        st.subheader("広告経由 利益品番ランキング")
+        st.caption("広告経由注文の粗利（売上−原価）を品番別に集計・上位15")
+        ad_prod_profit = (ad_orders.groupby("品番")["利益"].sum()
+                          .sort_values(ascending=False).head(15).reset_index())
+        fig_ad_profit = px.bar(ad_prod_profit, x="利益", y="品番", orientation="h",
+                               color_discrete_sequence=[COLORS["primary"]])
+        fig_ad_profit.update_layout(yaxis_title="品番", xaxis_title="広告経由 利益（円）",
+                                    yaxis=dict(autorange="reversed"), height=520)
+        st.plotly_chart(fig_ad_profit, use_container_width=True)
+    else:
+        st.info("流入チャネルデータ（ga_sessions）がないため、広告経由の品番分析は表示できません。")
+
 
 # ============================================================
 # 📦 在庫分析
@@ -1406,16 +1340,6 @@ elif page == "在庫分析":
                           xaxis_title="月", yaxis_title="数量")
     st.plotly_chart(fig_inv, use_container_width=True)
 
-    st.subheader("倉庫別 在庫数比較（直近月）")
-    latest = inventory[inventory["date"] == inventory["date"].max()]
-    wh_comp = (latest.merge(products[["sku_id", "category"]], on="sku_id", how="left")
-               .groupby(["warehouse_type", "category"])["stock_quantity"].sum().reset_index())
-    fig_wh = px.bar(wh_comp, x="category", y="stock_quantity", color="warehouse_type",
-                    barmode="group", title="倉庫別 × カテゴリ別 在庫数",
-                    color_discrete_sequence=COLORS["chart"])
-    st.plotly_chart(fig_wh, use_container_width=True)
-
-    st.subheader("在庫回転率（カテゴリ別・直近6ヶ月）")
     recent = inv_filtered[inv_filtered["date"] >= inv_filtered["date"].max() - pd.DateOffset(months=5)]
     recent_cat = (recent.merge(products[["sku_id", "category"]], on="sku_id", how="left")
                   .groupby("category")
@@ -1509,6 +1433,30 @@ elif page == "キャンペーン分析":
     fig_daily.update_layout(xaxis_title="日付", yaxis_title="売上（円）")
     st.plotly_chart(fig_daily, use_container_width=True)
 
+    # ── キャンペーン期間中の 売上品番ランキング ──
+    st.subheader("売上品番ランキング（キャンペーン期間中）")
+    st.caption(f"{sel_camp} の期間"
+               f"（{camp_row['start_date'].strftime('%Y/%m/%d')}〜"
+               f"{camp_row['end_date'].strftime('%Y/%m/%d')}）の完了注文を品番別に集計・上位15")
+    _camp_mask = ((completed["order_date"] >= camp_row["start_date"])
+                  & (completed["order_date"] <= camp_row["end_date"]))
+    _camp_orders = completed.loc[_camp_mask].copy()
+    if _camp_orders.empty:
+        st.info("この期間に完了注文がありません。")
+    else:
+        _pm = products[["sku_id", "product_name", "color", "size"]].copy()
+        _pm["品番"] = (_pm["product_name"] + " " + _pm["color"].astype(str)
+                       + "/" + _pm["size"].astype(str) + "（" + _pm["sku_id"] + "）")
+        camp_prod = (_camp_orders.merge(_pm[["sku_id", "品番"]], on="sku_id", how="left")
+                     .groupby("品番")["total_amount"].sum()
+                     .sort_values(ascending=False).head(15)
+                     .reset_index().rename(columns={"total_amount": "売上"}))
+        fig_camp_prod = px.bar(camp_prod, x="売上", y="品番", orientation="h",
+                               color_discrete_sequence=[COLORS["accent"]])
+        fig_camp_prod.update_layout(yaxis_title="品番", xaxis_title="売上（円）",
+                                    yaxis=dict(autorange="reversed"), height=520)
+        st.plotly_chart(fig_camp_prod, use_container_width=True)
+
     st.subheader("全キャンペーン一覧")
     camp_disp = campaigns.copy()
     camp_disp["start_date"] = camp_disp["start_date"].dt.strftime("%Y/%m/%d")
@@ -1527,10 +1475,12 @@ elif page == "収支管理":
                 latest_date=orders["order_date"].max())
 
     pl = expenses.copy()
-    cost_cols = ["原価", "広告費", "倉庫代", "外注費", "物流費", "決済手数料", "システム費"]
+    # 広告費はクライアント側で別管理のため、このPLからは除外
+    cost_cols = ["原価", "倉庫代", "外注費", "物流費", "決済手数料", "システム費"]
     pl["総コスト"] = pl[cost_cols].sum(axis=1)
     pl["営業利益"] = pl["売上"] - pl["総コスト"]
     pl["利益率"] = (pl["営業利益"] / pl["売上"] * 100).round(1)
+    st.caption("※ 広告費は別管理のため、本シートのコスト・利益には含めていません。")
 
     # ── KPI（直近月） ──
     latest = pl.iloc[-1]
