@@ -884,9 +884,12 @@ elif page == "需要予測":
     future_df["lower"] = future_df["sales"] * 0.7
     future_df["upper"] = future_df["sales"] * 1.3
 
+    # 線グラフの実績は直近12ヶ月のみ表示（過去1年=2/3・予測6ヶ月=1/3で未来にフォーカス）
+    monthly_recent = monthly[monthly["date"] >= last_date - pd.DateOffset(months=11)]
+
     st.subheader("月次売上の実績と予測")
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=monthly["date"], y=monthly["sales"],
+    fig.add_trace(go.Scatter(x=monthly_recent["date"], y=monthly_recent["sales"],
                              mode="lines+markers", name="実績",
                              line=dict(color=COLORS["primary"], width=2)))
     fig.add_trace(go.Scatter(x=future_df["date"], y=future_df["sales"],
